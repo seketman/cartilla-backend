@@ -8,11 +8,7 @@ app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "clave-super-secreta")
 
 CARTILLAIA_SECRET = os.getenv("CARTILLAIA_SECRET", "jwt-cartillaia-secret")
-
-SERVER_SCHEME = os.getenv("SERVER_SCHEME", "http")
-SERVER_HOST = os.getenv("SERVER_HOST", "localhost")
-SERVER_PORT = int(os.getenv("SERVER_PORT", 5000))
-SERVER_URI = f"{SERVER_SCHEME}://{SERVER_HOST}:{SERVER_PORT}"
+SERVER_URI = os.getenv("SERVER_URI", "http://localhost:5000")
 CALLBACK_URI = os.getenv("CALLBACK_URI", f"{SERVER_URI}/auth/callback")
 
 # Config multi-tenant: cada obra social tiene su Tenant + Client ID + Secret
