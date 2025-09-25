@@ -80,7 +80,7 @@ def register_oidc_clients():
             client_kwargs={"scope": "openid profile email offline_access"},
         )
 
-@app.on_event("startup")
+@app.on_lifespan
 async def startup_event():
     register_oidc_clients()
 
