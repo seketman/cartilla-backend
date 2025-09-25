@@ -16,4 +16,5 @@ python-multipart==0.0.9
 # JWT para validar tokens
 PyJWT[crypto]==2.9.0
 
-SQLAlchemy==2.0.30
+# ORM y base de datos
+SQLAlchemy==2.0.35

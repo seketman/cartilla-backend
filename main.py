@@ -171,7 +171,7 @@ async def auth_callback(request: Request, os_key: str):
     refresh_token = token.get("refresh_token")
     expires_at = None
     if token.get("expires_in"):
-        expires_at = datetime.datetime.utcnow() + datetime.timedelta(seconds=int(token["expires_in"]))
+        expires_at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=int(token["expires_in"]))
     if refresh_token and sub:
         db_upsert_refresh(sub=sub, os_key=os_key, refresh_token=refresh_token, expires_at=expires_at)
 
