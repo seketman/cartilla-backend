@@ -1,6 +1,14 @@
-fastapi
-uvicorn[standard]
-authlib
-python-dotenv
-PyJWT
-SQLAlchemy
+# Framework principal
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+
+# OAuth2 / OpenID Connect
+authlib==1.3.1
+httpx==0.27.2
+
+# Variables de entorno (.env)
+python-dotenv==1.0.1
+
+# Sesiones y seguridad
+itsdangerous==2.2.0
+python-multipart==0.0.9
