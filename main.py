@@ -1,112 +1,259 @@
-from flask import Flask, redirect, request, jsonify, session
-from authlib.integrations.flask_client import OAuth
-import jwt
-import datetime
 import os
+import datetime
+from typing import Optional
 
-app = Flask(__name__)
-app.secret_key = os.getenv("FLASK_SECRET_KEY", "clave-super-secreta")
+from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi.responses import RedirectResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from authlib.integrations.starlette_client import OAuth, OAuthError
+import jwt  # PyJWT
+from sqlalchemy import create_engine, Column, String, Integer, DateTime, select
+from sqlalchemy.orm import sessionmaker, declarative_base
 
-CARTILLAIA_SECRET = os.getenv("CARTILLAIA_SECRET", "jwt-cartillaia-secret")
-SERVER_URI = os.getenv("SERVER_URI", "http://localhost:5000")
-CALLBACK_URI = os.getenv("CALLBACK_URI", f"{SERVER_URI}/auth/callback")
+from dotenv import load_dotenv
 
-# Config multi-tenant: cada obra social tiene su Tenant + Client ID + Secret
-# En un sistema real, esto lo guardarías en una DB
-OBRAS_SOCIALES = {
-    "medife": {
-        "tenant_id": os.getenv("MEDIFE_TENANT_ID"),
-        "client_id": os.getenv("MEDIFE_CLIENT_ID"),
-        "client_secret": os.getenv("MEDIFE_CLIENT_SECRET")
-    },
-    "osde": {
-        "tenant_id": os.getenv("OSDE_TENANT_ID"),
-        "client_id": os.getenv("OSDE_CLIENT_ID"),
-        "client_secret": os.getenv("OSDE_CLIENT_SECRET")
-    }
-}
+load_dotenv()  # carga .env en local (Render usa env vars del panel)
 
-oauth = OAuth(app)
+# ---------- Config ----------
+PORT = int(os.getenv("PORT", "10000"))
+FRONTEND_BASE = os.getenv("FRONTEND_BASE", "http://localhost:3000")
+CARTILLAIA_SECRET = os.getenv("CARTILLAIA_SECRET", "cartillaia-secret-for-dev")
+JWT_EXP_MINUTES = int(os.getenv("JWT_EXP_MINUTES", "15"))
 
-def get_oidc_provider(os_key):
-    config = OBRAS_SOCIALES[os_key]
-    return oauth.register(
-        name=f"azure_{os_key}",
-        client_id=config["client_id"],
-        client_secret=config["client_secret"],
-        server_metadata_url=f"https://login.microsoftonline.com/{config['tenant_id']}/v2.0/.well-known/openid-configuration",
-        client_kwargs={"scope": "openid profile email offline_access"}  # offline_access = refresh_token
-    )
+# Obras sociales: cada bloque debe estar configurado en variables de entorno
+# MEDIFE_* and OSDE_*
+OS_KEYS = ["medife", "osde"]
 
-def generate_cartillaia_jwt(userinfo):
+# ---------- DB (SQLite simple para POC) ----------
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./tokens.db")
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+Base = declarative_base()
+
+class RefreshTokenEntry(Base):
+    __tablename__ = "refresh_tokens"
+    id = Column(Integer, primary_key=True, index=True)
+    sub = Column(String, index=True)           # unique user id from IdP
+    os_key = Column(String, index=True)        # medife or osde
+    refresh_token = Column(String)
+    expires_at = Column(DateTime, nullable=True)  # optional
+
+Base.metadata.create_all(bind=engine)
+
+# ---------- OAuth Client setup ----------
+oauth = OAuth()
+app = FastAPI(title="CartillaIA Auth POC")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[os.getenv("FRONTEND_ORIGIN", FRONTEND_BASE)],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+def register_oidc_clients():
+    """
+    Registra clientes OIDC en authlib a partir de env vars:
+      - {OS}_TENANT_ID
+      - {OS}_CLIENT_ID
+      - {OS}_CLIENT_SECRET
+      - {OS}_REDIRECT_URI  (opcional, se usará la ruta /auth/callback/{os_key})
+    """
+    for key in OS_KEYS:
+        prefix = key.upper()
+        tenant = os.getenv(f"{prefix}_TENANT_ID")
+        client_id = os.getenv(f"{prefix}_CLIENT_ID")
+        client_secret = os.getenv(f"{prefix}_CLIENT_SECRET")
+        redirect = os.getenv(f"{prefix}_REDIRECT_URI",
+                              f"https://{os.getenv('RENDER_EXTERNAL_URL','localhost')}:/api/auth/callback/{key}")
+        if not (tenant and client_id and client_secret):
+            # no raise: permite deploy aunque falten vars (pero login fallará)
+            continue
+        name = f"azure_{key}"
+        server_metadata_url = f"https://login.microsoftonline.com/{tenant}/v2.0/.well-known/openid-configuration"
+        oauth.register(
+            name=name,
+            client_id=client_id,
+            client_secret=client_secret,
+            server_metadata_url=server_metadata_url,
+            client_kwargs={"scope": "openid profile email offline_access"},
+        )
+
+@app.on_event("startup")
+async def startup_event():
+    register_oidc_clients()
+
+# ---------- Helpers ----------
+def create_cartillaia_jwt(sub: str, email: Optional[str], name: Optional[str], os_key: str):
+    now = datetime.datetime.utcnow()
     payload = {
-        "sub": userinfo["sub"],
-        "email": userinfo.get("email") or userinfo.get("preferred_username"),
-        "name": userinfo.get("name"),
-        "exp": datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=15),
-        "iss": "CartillaIA"
+        "sub": sub,
+        "email": email,
+        "name": name,
+        "os_key": os_key,
+        "iss": "CartillaIA",
+        "iat": now,
+        "exp": now + datetime.timedelta(minutes=JWT_EXP_MINUTES)
     }
-    return jwt.encode(payload, CARTILLAIA_SECRET, algorithm="HS256")
+    token = jwt.encode(payload, CARTILLAIA_SECRET, algorithm="HS256")
+    # PyJWT returns str in modern versions
+    if isinstance(token, bytes):
+        token = token.decode()
+    return token
 
-@app.route("/login/<os_key>")
-def login(os_key):
-    provider = get_oidc_provider(os_key)
-    return provider.authorize_redirect(
-        redirect_uri=f"{CALLBACK_URI}/{os_key}"
-    )
-
-@app.route("/auth/callback/<os_key>")
-def auth_callback(os_key):
-    provider = get_oidc_provider(os_key)
-    token = provider.authorize_access_token()
-    userinfo = token.get("userinfo") or provider.parse_id_token(token)
-
-    # Guardar refresh_token seguro en backend
-    session["refresh_token"] = token.get("refresh_token")
-    session["os_key"] = os_key
-    session["sub"] = userinfo["sub"]
-
-    # Emitir JWT propio de CartillaIA
-    cartillaia_jwt = generate_cartillaia_jwt(userinfo)
-
-    return redirect(f"{SERVER_URI}/dashboard?token={cartillaia_jwt}")
-
-@app.route("/me")
-def me():
-    auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer "):
-        return jsonify({"error": "missing_token"}), 401
-    
-    token = auth_header.split(" ")[1]
+def decode_cartillaia_jwt(token: str):
     try:
-        decoded = jwt.decode(token, CARTILLAIA_SECRET, algorithms=["HS256"])
-        return jsonify(decoded)
+        return jwt.decode(token, CARTILLAIA_SECRET, algorithms=["HS256"])
     except jwt.ExpiredSignatureError:
-        return jsonify({"error": "token_expired"}), 401
+        raise HTTPException(status_code=401, detail="cartillaia_token_expired")
     except jwt.InvalidTokenError:
-        return jsonify({"error": "invalid_token"}), 401
+        raise HTTPException(status_code=401, detail="invalid_cartillaia_token")
 
-@app.route("/refresh")
-def refresh():
-    if "refresh_token" not in session or "os_key" not in session:
-        return jsonify({"error": "not_authenticated"}), 401
-    
-    provider = get_oidc_provider(session["os_key"])
-    new_token = provider.refresh_token(
-        provider.client_kwargs["server_metadata"]["token_endpoint"],
-        refresh_token=session["refresh_token"]
-    )
+def db_get_refresh(sub: str, os_key: str):
+    db = SessionLocal()
+    try:
+        q = db.query(RefreshTokenEntry).filter_by(sub=sub, os_key=os_key).first()
+        return q
+    finally:
+        db.close()
 
-    userinfo = provider.parse_id_token(new_token)
+def db_upsert_refresh(sub: str, os_key: str, refresh_token: str, expires_at: Optional[datetime.datetime]=None):
+    db = SessionLocal()
+    try:
+        entry = db.query(RefreshTokenEntry).filter_by(sub=sub, os_key=os_key).first()
+        if entry:
+            entry.refresh_token = refresh_token
+            entry.expires_at = expires_at
+        else:
+            entry = RefreshTokenEntry(sub=sub, os_key=os_key, refresh_token=refresh_token, expires_at=expires_at)
+            db.add(entry)
+        db.commit()
+    finally:
+        db.close()
 
-    # Guardar el nuevo refresh_token si vino actualizado
-    if "refresh_token" in new_token:
-        session["refresh_token"] = new_token["refresh_token"]
+# ---------- Routes ----------
+@app.get("/login/{os_key}")
+async def login(request: Request, os_key: str):
+    if os_key not in OS_KEYS:
+        raise HTTPException(status_code=404, detail="unknown_os")
+    client_name = f"azure_{os_key}"
+    client = oauth.create_client(client_name)
+    if client is None:
+        raise HTTPException(status_code=500, detail=f"oidc_client_not_configured_for_{os_key}")
+    redirect_uri = os.getenv(f"{os_key.upper()}_REDIRECT_URI",
+                             f"{request.url.scheme}://{request.url.hostname}/api/auth/callback/{os_key}")
+    return await client.authorize_redirect(request, redirect_uri)
 
-    # Emitir nuevo JWT de CartillaIA
-    new_cartillaia_jwt = generate_cartillaia_jwt(userinfo)
+@app.get("/auth/callback/{os_key}")
+async def auth_callback(request: Request, os_key: str):
+    if os_key not in OS_KEYS:
+        raise HTTPException(status_code=404, detail="unknown_os")
+    client_name = f"azure_{os_key}"
+    client = oauth.create_client(client_name)
+    if client is None:
+        raise HTTPException(status_code=500, detail=f"oidc_client_not_configured_for_{os_key}")
+    try:
+        token = await client.authorize_access_token(request)
+    except OAuthError as err:
+        raise HTTPException(status_code=400, detail=f"oauth_error: {err.error}")
+    # token is a dict with access_token, id_token, refresh_token (if offline_access), expires_in...
+    # parse id_token to get user info
+    try:
+        userinfo = token.get("userinfo") or await client.parse_id_token(request, token)
+    except Exception:
+        userinfo = {}
+    sub = userinfo.get("sub") or userinfo.get("oid") or userinfo.get("preferred_username")
+    email = userinfo.get("email") or userinfo.get("preferred_username")
+    name = userinfo.get("name")
 
-    return jsonify({"token": new_cartillaia_jwt})
+    # Guardar refresh_token en DB (si viene)
+    refresh_token = token.get("refresh_token")
+    expires_at = None
+    if token.get("expires_in"):
+        expires_at = datetime.datetime.utcnow() + datetime.timedelta(seconds=int(token["expires_in"]))
+    if refresh_token and sub:
+        db_upsert_refresh(sub=sub, os_key=os_key, refresh_token=refresh_token, expires_at=expires_at)
 
-if __name__ == "__main__":
-    app.run(debug=True)
+    # Generar JWT CartillaIA y redirigir al frontend con token en query string (POC)
+    cart_jwt = create_cartillaia_jwt(sub=sub, email=email, name=name, os_key=os_key)
+    redirect_to = f"{os.getenv('FRONTEND_BASE', FRONTEND_BASE)}/dashboard?token={cart_jwt}"
+    return RedirectResponse(url=redirect_to)
+
+@app.get("/me")
+async def me(request: Request):
+    auth = request.headers.get("Authorization")
+    if not auth or not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="missing_token")
+    token = auth.split(" ", 1)[1]
+    payload = decode_cartillaia_jwt(token)
+    return JSONResponse(content=payload)
+
+@app.post("/refresh")
+async def refresh(request: Request):
+    """
+    Refresca el JWT CartillaIA usando el refresh_token guardado.
+    El frontend debe enviar Authorization: Bearer <cartillaia_jwt_expired_or_not>
+    Este endpoint decodifica el cartillaia JWT para obtener sub + os_key.
+    """
+    auth = request.headers.get("Authorization")
+    if not auth or not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="missing_token")
+    token = auth.split(" ", 1)[1]
+    # We should decode WITHOUT validating exp, so we can allow expired CartillaIA token to request refresh.
+    try:
+        payload = jwt.decode(token, CARTILLAIA_SECRET, algorithms=["HS256"], options={"verify_exp": False})
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="invalid_cartillaia_token")
+
+    sub = payload.get("sub")
+    os_key = payload.get("os_key")
+    if not sub or not os_key:
+        raise HTTPException(status_code=400, detail="invalid_token_payload")
+
+    entry = db_get_refresh(sub=sub, os_key=os_key)
+    if not entry or not entry.refresh_token:
+        raise HTTPException(status_code=401, detail="no_refresh_token_stored")
+
+    # get token endpoint from client's metadata
+    client_name = f"azure_{os_key}"
+    client = oauth.create_client(client_name)
+    if client is None:
+        raise HTTPException(status_code=500, detail=f"oidc_client_not_configured_for_{os_key}")
+
+    # token_endpoint is in client's server_metadata
+    token_endpoint = client.client_kwargs.get("token_endpoint")
+    # but authlib stores metadata in client.server_metadata if available
+    if not token_endpoint:
+        md = client.server_metadata or {}
+        token_endpoint = md.get("token_endpoint")
+    if not token_endpoint:
+        # fallback for azure pattern
+        tenant = os.getenv(f"{os_key.upper()}_TENANT_ID")
+        token_endpoint = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+
+    try:
+        new_token = await client.refresh_token(token_endpoint, refresh_token=entry.refresh_token)
+    except Exception as e:
+        # refresh failed -> remove stored refresh to force full re-login
+        db_upsert_refresh(sub=sub, os_key=os_key, refresh_token="", expires_at=None)
+        raise HTTPException(status_code=400, detail=f"refresh_failed: {str(e)}")
+
+    # update stored refresh_token if rotated
+    new_refresh = new_token.get("refresh_token")
+    if new_refresh:
+        db_upsert_refresh(sub=sub, os_key=os_key, refresh_token=new_refresh,
+                          expires_at=(datetime.datetime.utcnow() + datetime.timedelta(seconds=int(new_token.get("expires_in", 3600))) if new_token.get("expires_in") else None))
+
+    # parse id_token for userinfo (if present)
+    try:
+        userinfo = await client.parse_id_token(request, new_token)
+    except Exception:
+        userinfo = {}
+
+    new_cart_jwt = create_cartillaia_jwt(sub=sub, email=userinfo.get("email"), name=userinfo.get("name"), os_key=os_key)
+    return {"token": new_cart_jwt}
+
+@app.get("/")
+async def root():
+    return {"status": "ok"}

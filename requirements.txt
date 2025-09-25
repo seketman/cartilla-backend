@@ -1,4 +1,6 @@
 fastapi
-uvicorn
+uvicorn[standard]
 authlib
 python-dotenv
+PyJWT
+SQLAlchemy
