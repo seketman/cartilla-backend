@@ -66,7 +66,7 @@ def register_oidc_clients():
         client_id = os.getenv(f"{prefix}_CLIENT_ID")
         client_secret = os.getenv(f"{prefix}_CLIENT_SECRET")
         redirect = os.getenv(f"{prefix}_REDIRECT_URI",
-                              f"https://{os.getenv('RENDER_EXTERNAL_URL','localhost')}:/api/auth/callback/{key}")
+                              f"https://{os.getenv('RENDER_EXTERNAL_URL','localhost')}:/auth/callback/{key}")
         if not (tenant and client_id and client_secret):
             # no raise: permite deploy aunque falten vars (pero login fallará)
             continue
@@ -142,7 +142,7 @@ async def login(request: Request, os_key: str):
     if client is None:
         raise HTTPException(status_code=500, detail=f"oidc_client_not_configured_for_{os_key}")
     redirect_uri = os.getenv(f"{os_key.upper()}_REDIRECT_URI",
-                             f"{request.url.scheme}://{request.url.hostname}/api/auth/callback/{os_key}")
+                             f"{request.url.scheme}://{request.url.hostname}/auth/callback/{os_key}")
     return await client.authorize_redirect(request, redirect_uri)
 
 @app.get("/auth/callback/{os_key}")
